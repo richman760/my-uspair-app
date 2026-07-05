@@ -3,6 +3,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import itertools
+import requests
+import time
 from datetime import datetime
 import pytz
 import warnings
@@ -10,7 +12,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 1. 설정 및 미국 50개 종목 리스트 (원본과 100% 동일)
+# 1. 설정 및 미국 50개 종목 리스트 
 # ==========================================
 WATCH_LIST = [
     'SPY', 'QQQ', 'DIA', 'AAPL', 'MSFT', 'NVDA', 'AMZN', 'GOOGL', 'META', 'TSLA', 
@@ -23,7 +25,29 @@ WATCH_LIST = [
 st.set_page_config(page_title="🇺🇸 미국 일봉 괴리율 스캐너", layout="wide")
 
 # ==========================================
-# 2. UI 및 사이드바 설정
+# 2. 강력한 실시간 환율 엔진 (캐시 없음! 무조건 실시간 호출)
+# ==========================================
+def get_realtime_usdkrw() -> float:
+    # 1차 시도: yfinance 정밀 조회
+    try:
+        df = yf.download("KRW=X", period="1d", interval="1d", progress=False)
+        if not df.empty:
+            v = float(df["Close"].iloc[-1])
+            return round(1 / v, 4) if v < 10 else round(v, 4)
+    except: 
+        pass
+        
+    # 2차 시도: 외부 오픈 API 백업 조회
+    try:
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=5)
+        r.raise_for_status()
+        return float(r.json()["rates"]["KRW"])
+    except:
+        # 최악의 경우를 대비한 비상 환율
+        return 1530.0
+
+# ==========================================
+# 3. UI 및 사이드바 설정
 # ==========================================
 st.title("🇺🇸 미국 주식 통계적 괴리율(Pairs) 일봉 스캐너")
 st.write("최근 1년 치 일봉 데이터를 분석하여, 60거래일(약 3개월) 기준 통계적 범위를 벗어난 **확실한 일봉 타점**을 찾아냅니다.")
@@ -34,16 +58,10 @@ entry_z_score = st.sidebar.slider("진입 Z-Score (기본 2.0)", 1.0, 3.0, 2.0, 
 rolling_window = st.sidebar.number_input("이동평균 기준일 (기본 60일)", min_value=10, max_value=120, value=60)
 
 # ==========================================
-# 3. 핵심 데이터 로직 (원본 로직 반영)
+# 4. 핵심 데이터 로직 (주가 데이터만 캐싱)
 # ==========================================
-@st.cache_data(ttl=3600) # 일봉 데이터이므로 1시간(3600초) 단위 캐싱으로 충분
+@st.cache_data(ttl=600) # 주가 데이터는 10분만 캐싱하여 신선도 유지
 def scan_us_pairs(corr_limit, z_limit, window):
-    # 실시간 환율 정보 가져오기
-    try:
-        exchange_rate = yf.Ticker("KRW=X").history(period="1d")['Close'].iloc[-1]
-    except: 
-        exchange_rate = 1400.0
-        
     # 야후 파이낸스 데이터 1년 치 일봉 다운로드
     data = yf.download(WATCH_LIST, period="1y", interval="1d", prepost=False, progress=False)['Close']
     data = data.dropna(axis=1)
@@ -94,25 +112,29 @@ def scan_us_pairs(corr_limit, z_limit, window):
                 'Z-Score': round(current_z, 2),
                 'A 현재가($)': pA,
                 'B 현재가($)': pB,
-                'A 현재가(₩)': pA * exchange_rate,
-                'B 현재가(₩)': pB * exchange_rate,
+                # 원화 가격은 실시간 환율을 반영하기 위해 여기서 미리 계산하지 않음!
                 '_rank_score': rank_score,
                 '_abs_z': abs(current_z)
             })
             
-    return pd.DataFrame(opportunities), len(tickers_available), exchange_rate
+    return pd.DataFrame(opportunities), len(tickers_available)
 
 # ==========================================
-# 4. 화면 출력 및 버튼
+# 5. 화면 출력 및 실행
 # ==========================================
 kst = datetime.now(pytz.timezone('Asia/Seoul'))
 st.write(f"🕒 현재 한국 시간: {kst.strftime('%Y-%m-%d %H:%M:%S')}")
 
+# 버튼 클릭 시에만 전체 로직 수행
 if st.button("🚀 미국장 일봉 타점 스캔 시작", use_container_width=True):
-    with st.spinner("최근 1년 치 일봉 데이터 분석 중 (잠시만 기다려주세요)..."):
-        df, available_count, ex_rate = scan_us_pairs(min_correlation, entry_z_score, rolling_window)
+    with st.spinner("데이터 스캔 및 실시간 환율 적용 중..."):
         
-        st.info(f"✅ {available_count}개 우량주 데이터 확보 완료. (현재환율 적용: {ex_rate:,.2f}원)")
+        # 🔥 여기서 버튼을 누르는 순간 100% 최신 환율을 긁어옴! (캐시 안됨) 🔥
+        realtime_ex_rate = get_realtime_usdkrw()
+        
+        df, available_count = scan_us_pairs(min_correlation, entry_z_score, rolling_window)
+        
+        st.info(f"✅ {available_count}개 우량주 데이터 확보 완료. (현재 실시간 환율 적용: **{realtime_ex_rate:,.2f}원**)")
         
         if not df.empty:
             # 1순위(상관도 0.95 이상) 최우선, 그 다음 Z-Score 절대값 큰 순서로 정렬
@@ -121,12 +143,17 @@ if st.button("🚀 미국장 일봉 타점 스캔 시작", use_container_width=T
             # 정렬용 임시 컬럼 삭제
             df = df.drop(columns=['_rank_score', '_abs_z'])
             
-            # 가격 컬럼 포맷팅 (달러 및 원화)
+            # 🔥 실시간 환율을 여기서 곱해줌 🔥
+            df['A 현재가(₩)'] = df['A 현재가($)'] * realtime_ex_rate
+            df['B 현재가(₩)'] = df['B 현재가($)'] * realtime_ex_rate
+            
+            # 가격 컬럼 포맷팅 (달러 및 원화 콤마 처리)
             df['A 현재가($)'] = df['A 현재가($)'].apply(lambda x: f"${float(x):,.2f}")
             df['B 현재가($)'] = df['B 현재가($)'].apply(lambda x: f"${float(x):,.2f}")
             df['A 현재가(₩)'] = df['A 현재가(₩)'].apply(lambda x: f"₩{int(x):,}")
             df['B 현재가(₩)'] = df['B 현재가(₩)'].apply(lambda x: f"₩{int(x):,}")
             
+            # 최종 출력
             st.success(f"🔥 총 {len(df)}개의 확실한 일봉 타점 발견! (내일 본장 진입 고려)")
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
